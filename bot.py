@@ -260,10 +260,50 @@ async def help_command(ctx):
     embed.add_field(name="💰 Economia", value="`!daily`, `!money`, `!shop`, `!buy <item>`", inline=False)
     embed.add_field(name="🏆 Rank", value="`!xp`, `!rank`", inline=False)
     embed.add_field(name="📜 Regras", value="`!regras`", inline=False)
-    embed.add_field(name="🎫 Tickets", value="`!ticket <motivo>` (abre canal privado)", inline=False)
+    embed.add_field(name="🎫 Tickets", value="`!ticket <motivo>` (abre canal privado) ou use o botão no painel", inline=False)
     embed.add_field(name="🛡 Administração", value="`!paineladm` (apenas staff)", inline=False)
     await ctx.send(embed=embed)
     logging.info(f"{ctx.author} usou !help")
+
+# -----------------------
+# VIEW & BUTTON PARA ABRIR TICKET (integração com painel)
+# -----------------------
+class TicketView(discord.ui.View):
+    def __init__(self, author):
+        super().__init__(timeout=None)
+        self.author = author  # usuário que abriu o painel (para validar se necessário)
+
+    @discord.ui.button(label="Abrir Ticket", style=discord.ButtonStyle.blurple, custom_id="open_ticket_button")
+    async def open_ticket(self, button: discord.ui.Button, interaction: discord.Interaction):
+        # cria o ticket com a mesma lógica do comando !ticket
+        guild = interaction.guild
+        member = interaction.user
+        # cria categoria TICKETS se não existir
+        cat = discord.utils.get(guild.categories, name="TICKETS")
+        if not cat:
+            cat = await guild.create_category("TICKETS")
+        # permissões
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            member: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+        }
+        for rname in STAFF_ROLES:
+            role = discord.utils.get(guild.roles, name=rname)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+        # cria canal
+        channel_name = f"ticket-{member.name}".lower().replace(" ", "-")
+        existing = discord.utils.get(guild.text_channels, name=channel_name)
+        if existing:
+            await interaction.response.send_message(f"Você já tem um ticket aberto: {existing.mention}", ephemeral=True)
+            return
+        ch = await guild.create_text_channel(channel_name, category=cat, overwrites=overwrites)
+        await ch.send(f"🎫 Ticket criado por {member.mention}\nMotivo: Aberto pelo painel (botão)")
+        await interaction.response.send_message(f"✅ Ticket criado: {ch.mention}", ephemeral=True)
+        logging.info(f"{member} abriu ticket via botão: {ch.name}")
+        log_ch = discord.utils.get(guild.text_channels, name="log-ticket")
+        if log_ch:
+            await log_ch.send(f"🎫 Ticket criado: {ch.mention} por {member.mention} | Aberto via painel (botão)")
 
 @bot.command()
 async def painel(ctx):
@@ -278,13 +318,15 @@ async def painel(ctx):
     embed.add_field(name="💰 Saldo", value=f"{coins} moedas", inline=False)
     embed.add_field(name="⭐ XP / Level", value=f"Level {user_info['level']} | XP {user_info['xp']}", inline=False)
     embed.add_field(name="🛒 Loja", value="Use `!shop` para abrir a loja", inline=False)
-    embed.add_field(name="🎫 Ticket", value="Use `!ticket <motivo>` para abrir um ticket privado", inline=False)
+    embed.add_field(name="🎫 Ticket", value="Use `!ticket <motivo>` para abrir um ticket privado ou clique no botão abaixo", inline=False)
     embed.add_field(name="📜 Regras", value="Use `!regras`", inline=False)
-    await ctx.send(embed=embed)
+    view = TicketView(ctx.author)
+    await ctx.send(embed=embed, view=view)
     logging.info(f"{ctx.author} abriu o painel")
 
 # -----------------------
 # PAINELADM + FUNÇÕES ADICIONAIS
+# (NÃO ALTEREI NADA AQUI, mantive exatamente como você pediu)
 # -----------------------
 @bot.command()
 @commands.has_any_role(*STAFF_ROLES)
@@ -491,6 +533,107 @@ async def closeticket(ctx):
         await ctx.send("Este comando só funciona dentro de um canal de ticket.")
 
 # -----------------------
+# NOVOS COMANDOS: REGRAS, RANK, TOP100, RESET SEASON
+# -----------------------
+@bot.command(name="regras")
+async def regras(ctx):
+    embed = discord.Embed(title="📜 Regras do Servidor", color=discord.Color.blue())
+    embed.description = (
+        "**• Regras •**\n\n"
+        "- ❌ Não tomaremos nenhum tipo de desrespeito ou traição\n\n"
+        "- 🗺️ Não divulgar localização da base para ninguém (isso inclui coordenadas ou dar tp para alguém ir para tal)\n\n"
+        "- 🤫 Não saiam distribuindo métodos de Farm, segredos ou planos para pessoas alheias\n\n"
+        "- 👥 Respeitem todos no servidor independente do cargo\n\n"
+        "- 💬 Não spammar nos chat's"
+    )
+    await ctx.send(embed=embed)
+    logging.info(f"{ctx.author} usou !regras")
+
+@bot.command(name="rank")
+async def rank(ctx, member: discord.Member = None):
+    xp_data = load_xp()
+    gid = str(ctx.guild.id)
+    if gid not in xp_data or not xp_data[gid]:
+        await ctx.send("❌ Nenhum dado de XP encontrado neste servidor.")
+        return
+    data = xp_data[gid]
+    # cria ranking por XP total (usa xp e level à vista)
+    ranking = sorted(data.items(), key=lambda x: x[1].get("xp", 0) + x[1].get("level", 0)*1000, reverse=True)
+    # se não passou membro, mostra o invocador
+    if member is None:
+        member = ctx.author
+    uid = str(member.id)
+    # posição do usuário
+    pos = None
+    for i, (user_id, vals) in enumerate(ranking, start=1):
+        if user_id == uid:
+            pos = i
+            user_vals = vals
+            break
+    # embed com top10
+    embed = discord.Embed(title=f"🏆 Rank - {ctx.guild.name}", color=discord.Color.gold())
+    embed.set_footer(text=f"Pedido por {ctx.author.display_name}")
+    # mostrar posição do usuário
+    if pos:
+        embed.add_field(name=f"🔖 Posição de {member.display_name}", value=f"#{pos} — Level {user_vals['level']} | XP {user_vals['xp']}", inline=False)
+    else:
+        embed.add_field(name=f"🔖 Posição de {member.display_name}", value="Sem ranking (0 XP)", inline=False)
+    # top10
+    top_count = min(10, len(ranking))
+    text = ""
+    shown = 0
+    for i, (user_id, vals) in enumerate(ranking, start=1):
+        if shown >= top_count:
+            break
+        user_obj = ctx.guild.get_member(int(user_id))
+        name = user_obj.display_name if user_obj else f"Desconhecido ({user_id})"
+        text += f"#{i} — {name} • Level {vals['level']} | XP {vals['xp']}\n"
+        shown += 1
+    embed.add_field(name=f"🏅 Top {top_count}", value=text or "Nenhum dado", inline=False)
+    await ctx.send(embed=embed)
+    logging.info(f"{ctx.author} usou !rank")
+
+@bot.command(name="top100")
+async def top100(ctx):
+    xp_data = load_xp()
+    gid = str(ctx.guild.id)
+    if gid not in xp_data or not xp_data[gid]:
+        await ctx.send("❌ Nenhum dado de XP encontrado neste servidor.")
+        return
+    data = xp_data[gid]
+    ranking = sorted(data.items(), key=lambda x: x[1].get("xp", 0) + x[1].get("level", 0)*1000, reverse=True)
+    embed = discord.Embed(title=f"📈 Top 100 - {ctx.guild.name}", color=discord.Color.purple())
+    out = ""
+    for i, (user_id, vals) in enumerate(ranking[:100], start=1):
+        user = ctx.guild.get_member(int(user_id))
+        name = user.display_name if user else f"Desconhecido ({user_id})"
+        out += f"{i}. {name} — Level {vals['level']} | XP {vals['xp']}\n"
+    embed.description = out or "Nenhum dado"
+    await ctx.send(embed=embed)
+    logging.info(f"{ctx.author} usou !top100")
+
+@bot.command(name="resetseason")
+@commands.has_permissions(administrator=True)
+async def resetseason(ctx, confirm: str = None):
+    """
+    Uso: !resetseason confirm
+    Para evitar resets acidentais, é necessário passar o argumento confirm exatamente: YES
+    Ex: !resetseason YES
+    """
+    if confirm != "YES":
+        await ctx.send("⚠️ Para confirmar o reset da season e zerar o XP deste servidor, rode: `!resetseason YES`")
+        return
+    xp_data = load_xp()
+    gid = str(ctx.guild.id)
+    if gid in xp_data:
+        xp_data[gid] = {}  # zera todos os dados do servidor
+        save_xp(xp_data)
+        await ctx.send("✅ Season resetada — XP do servidor zerado.")
+        logging.info(f"{ctx.author} resetou a season do servidor {ctx.guild.name}")
+    else:
+        await ctx.send("❌ Não há dados de XP neste servidor.")
+
+# -----------------------
 # CRIAR CANAIS DE LOGS (OPÇÃO 1: canais separados)
 # -----------------------
 @bot.command()
@@ -589,6 +732,7 @@ async def on_message(message):
 
 # -----------------------
 # LIGAR / DESLIGAR BOT (com @everyone)
+# (mantive suas funções originais e o check global)
 # -----------------------
 @bot.command()
 @commands.has_any_role(*STAFF_ROLES)
@@ -625,8 +769,7 @@ async def on_command_error(ctx, error):
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send("❌ Está faltando um argumento.")
     else:
-        await ctx.send(f"❌ Erro: {error}")
-
+        await ctx.send(f"❌
 # -----------------------
 # RODAR O BOT
 # -----------------------
